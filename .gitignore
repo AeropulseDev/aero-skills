@@ -1,0 +1,10 @@
+config.yaml
+state.json
+inbox.md
+probe.json
+__pycache__/
+.venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
