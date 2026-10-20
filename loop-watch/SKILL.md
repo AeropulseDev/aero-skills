@@ -5,6 +5,8 @@ description: Дешёвое наблюдение за GitHub (новые ком�
 
 # loop-watch — наблюдатель за GitHub
 
+Версия навыка: 2026-10-20 · Исходник: `aero-skills/loop-watch/SKILL.md` (https://github.com/AeropulseDev/aero-skills). Сверка версии — по правилу `skills-index`.
+
 Команды: на Windows — `python watch.py …`; агент Claude в своей Linux-оболочке на компьютере — `python3 watch.py …`.
 Файлы: `watch.py`, `probe.js`, `config.yaml` (личный, из `config.example.yaml`), `state.json` (база), `inbox.md` (выжимки, новые сверху). `config.yaml`, `state.json`, `inbox.md`, `probe.json` — в `.gitignore`. Подробности — `README.md`.
 
