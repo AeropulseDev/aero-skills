@@ -1,6 +1,8 @@
 # aero-skills
 
-Открытые навыки (skills) для ИИ-агентов Claude — чтобы работа с GitHub через агентов почти не тратила токены: агент не перечитывает то, что не менялось, и просыпается только при новом.
+Открытые навыки для **любых** ИИ-агентов (Claude, Codex, Cursor, Gemini CLI, Aider, свои на API) — чтобы работа с GitHub через агентов почти не тратила токены: агент не перечитывает то, что не менялось, и просыпается только при новом.
+
+Навык здесь — обычная папка: `SKILL.md` (Markdown: когда применять и что делать) и, где нужно, скрипт. Привязки к конкретному агенту нет.
 
 | Навык | Что делает |
 |---|---|
@@ -12,12 +14,17 @@
 
 ```
 git clone https://github.com/AeropulseDev/aero-skills
-# Claude Code, все проекты:  ~/.claude/skills/   (Windows: %USERPROFILE%\.claude\skills\)
-# только проект:             <проект>/.claude/skills/
-cp -r aero-skills/skills-index aero-skills/git-repo-context-economy aero-skills/loop-watch ~/.claude/skills/
 ```
 
-В claude.ai: Settings → Capabilities → Skills → загрузить папку навыка архивом (zip). Навыки подхватываются по `SKILL.md`.
+Подключите так, как принято в вашем агенте:
+- **Claude Code / claude.ai** — скопировать нужные папки в `~/.claude/skills/` (Windows: `%USERPROFILE%\.claude\skills\`) или `<проект>/.claude/skills/`; в claude.ai — Settings → Capabilities → Skills, загрузить папку архивом (zip). Подхватываются по `SKILL.md` сами.
+- **Любой другой агент** (Codex, Cursor, Gemini CLI, Aider, свой на API) — держать репозиторий рядом с проектом и одной строкой в файле инструкций агента (`AGENTS.md`, rules, системный промпт) написать: «начни с `aero-skills/skills-index/SKILL.md`». Агент читает указатель и сам открывает нужный `SKILL.md`.
+- **Без агента** — `loop-watch/watch.py` обычный Python-скрипт, работает по cron/планировщику сам по себе.
+
+Что учесть другим агентам:
+- `skills-index` — универсален.
+- `git-repo-context-economy` — принципы универсальны; в тексте встречаются инструменты Claude (Agent, `project_write`, `device_bash`), читайте как «сабагент», «постоянное хранилище сводок», «shell на машине пользователя».
+- `loop-watch` — режим с токеном (основной) от агента ничего не требует. Режим без токена (browser) нужен только агенту с браузером, умеющим выполнять JS на странице.
 
 ### Настройка `loop-watch`
 1. `cp config.example.yaml config.yaml` — заполнить `me`, `timezone` (или `city`), `active_hours`, `repos` (номера issue и/или `labels`).
