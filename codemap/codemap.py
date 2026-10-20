@@ -902,10 +902,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.no_md:
         md = render_md(files, args, sc, roots, name)
         if args.out:
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
             Path(args.out).write_text(md, encoding="utf-8", newline="\n")
         else:
             sys.stdout.write(md)
     if args.overview:
+        Path(args.overview).parent.mkdir(parents=True, exist_ok=True)
         Path(args.overview).write_text(render_overview(files, args, sc, roots, name), encoding="utf-8", newline="\n")
     if args.json:
         model = {"codemap": SCHEMA, "version": VERSION, "name": name, "roots": [norm_root(r) for r in roots],
