@@ -8,7 +8,7 @@
 |---|---|
 | [`loop-watch`](loop-watch/) | Бесплатный индекс изменений: следит за issue (по номерам и меткам), новыми issue, коммитами ветки и PR. `watch.py` — стандартная библиотека Python, без модели; новое пишет выжимками в `inbox.md`. Код выхода `10` — есть новое, агент читает только верх `inbox.md`. Только чтение. |
 | [`git-repo-context-economy`](git-repo-context-economy/) | Правила экономичного чтения GitHub (issues, PR, комментарии): фильтры в запросе (`since`, `per_page`, `label:`, `state:`), сквозные проходы через сабагента, батчинг запросов, сводки решений вместо перечитывания. |
-| [`skills-index`](skills-index/) | Указатель навыков: «что», «когда» и облако ключевых слов. Агент сверяет задачу с облаками и грузит только подходящие навыки. Свои закрытые навыки добавляйте в личную копию. |
+| [`skills-index`](skills-index/) | Указатель навыков: «что», «когда» и облако ключевых слов. Индекс собирается из двух реестров: открытый `registry.open.md` (в репозитории) и ваш личный `registry.closed.md` (в `.gitignore`). Как завести свои закрытые навыки — в [README](skills-index/README.md). |
 
 ## Установка
 
@@ -33,6 +33,9 @@ git clone https://github.com/AeropulseDev/aero-skills
 4. Расписание: Linux/macOS `*/30 * * * * cd /путь/loop-watch && python3 watch.py run`; Windows `schtasks /Create /SC MINUTE /MO 30 /TN loop-watch /TR "python C:\путь\loop-watch\watch.py run"`.
 
 Личные `config.yaml`, `state.json`, `inbox.md` в `.gitignore` — не публикуйте их.
+
+### Обновление
+В каждом `SKILL.md` есть строка `Версия навыка: …`. Агент при каждом использовании сверяет её с исходником (правило в `skills-index`) и подсказывает обновить копию. Копию в `~/.claude/skills` лучше делать ссылкой на клон (`mklink /J` / `ln -s`) — тогда обновление это просто `git pull`.
 
 ### Правило для агента
 > Сначала `skills-index`; по GitHub — `git-repo-context-economy`; «что нового» — только верх `inbox.md`, issue целиком не перечитывать.

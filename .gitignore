@@ -8,3 +8,7 @@ __pycache__/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# skills-index: личный реестр и собранная копия — только локально
+skills-index/registry.closed.md
+skills-index/INDEX.built.md

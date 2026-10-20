@@ -5,6 +5,8 @@ description: "Использовать при любой работе с GitHub-
 
 # Экономия контекста при работе с GitHub-репозиторием
 
+Версия навыка: 2026-10-20 · Исходник: `aero-skills/git-repo-context-economy/SKILL.md` (https://github.com/AeropulseDev/aero-skills). Сверка версии — по правилу `skills-index`.
+
 Применяется всегда, когда предстоит читать/анализировать issues, PR, комментарии или состояние репозитория через `gh`/`git`/GitHub API (в т.ч. через device_bash на компьютере пользователя).
 
 ## Правила
