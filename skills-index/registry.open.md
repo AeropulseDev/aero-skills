@@ -15,7 +15,7 @@
 Облако: codemap, карта кода, карта функций, function map, FUNCTION_MAP, genmap, структура проекта, роуты, эндпоинты, хендлеры, handlers, aiogram, FastAPI, aiohttp, FSM, StatesGroup, Depends, APIRouter, GAS, Apps Script, google.script.run, AST, diff карт, что изменилось, сравнить версии, добавлено удалено изменено, codemap.files.md, sidecar, --json, --overview, --nested, --depth, build_index.
 
 ## git-repo-context-economy — экономия контекста при работе с GitHub
-Доступ: открытый · Исходник: `aero-skills/git-repo-context-economy` · Версия: 2026-10-20
+Доступ: открытый · Исходник: `aero-skills/git-repo-context-economy` · Версия: 2026-11-05
 Что: правила чтения issues/PR/комментариев через gh, git, GitHub API без раздувания контекста: фильтры в запросе, сабагенты для сквозных проходов, батчинг, сводки решений в project docs, учёт того, где выполняется команда (device_bash).
 Когда: разбор issues, PR, ревью, комментариев, состояния репозитория, массовые запросы к GitHub API.
 Облако: issues, issue, PR, pull request, пулреквест, ревью, review, комментарии, gh, GitHub API, REST, search API, label, milestone, state, since, per_page, пагинация, фильтр, сабагент, subagent, батч, параллельные запросы, decisions log, сводка, project docs, project_write, контекст, токены, экономия, git fetch, device_bash, где выполняется команда.
