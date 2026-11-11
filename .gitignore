@@ -1,7 +1,12 @@
 config.yaml
 state.json
-inbox.md
+inbox*.md
+watch.db
+watch.db-journal
+watch.log
+state.v1.json
 probe.json
+acks.txt
 __pycache__/
 .venv/
 .idea/
