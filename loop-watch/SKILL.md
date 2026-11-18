@@ -1,11 +1,11 @@
 ---
 name: loop-watch
-description: Наблюдение за GitHub без затрат токенов: опрос из планировщика Windows, база watch.db, тост/Telegram; агент только читает непрочитанное. «что нового на гите», «следи за issue», «loop-watch не работает».
+description: "Наблюдение за GitHub без затрат токенов: опрос из планировщика Windows, база watch.db, тост/Telegram; агент только читает непрочитанное. «что нового на гите», «следи за issue», «loop-watch не работает»."
 ---
 
 # loop-watch v2 — наблюдатель за GitHub
 
-Версия навыка: 2026-11-11b · Исходник: `aero-skills/loop-watch/SKILL.md` (https://github.com/AeropulseDev/aero-skills). Сверка версии — по правилу `skills-index`.
+Версия навыка: 2026-11-18 · Исходник: `aero-skills/loop-watch/SKILL.md` (https://github.com/AeropulseDev/aero-skills). Сверка версии — по правилу `skills-index`.
 
 ## Как устроено (Claude в цикле НЕ участвует)
 - Планировщик Windows, задача `loop-watch`: каждые 15 минут и при входе в Windows `pythonw watch.py run`. Ставит `setup.cmd` (один раз, владелец двойным кликом).
