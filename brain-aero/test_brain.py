@@ -129,4 +129,46 @@ class BrainTests(unittest.TestCase):
         self.assertEqual(con.execute('SELECT count(*) FROM chunks WHERE kind="issue"').fetchone()[0], 3)
         con.close()
 
+    def test_local_embedding_build_search_and_cleanup(self):
+        semantic = self.root/'manuals'/'semantic.md'
+        lexical = self.root/'manuals'/'lexical.md'
+        semantic.write_text('# Semantic candidate\nunrelated passage\n', encoding='utf-8')
+        lexical.write_text('# rarequery reference\nrarequery lexical passage\n', encoding='utf-8')
+        self.c['embeddings'] = {
+            'enabled': True, 'model': 'fixture-model', 'cache_dir': 'model-cache',
+            'semantic_weight': 2.0, 'lexical_weight': 1.0,
+        }
+
+        class FakeEmbedder:
+            def embed(self, documents, batch_size=32):
+                return [[1.0, 0.0] if 'Semantic candidate' in text else [0.0, 1.0]
+                        for text in documents]
+
+            def query_embed(self, query):
+                return [[1.0, 0.0]]
+
+        original_get_embedder = brain._get_embedder
+        brain._get_embedder = lambda config: (FakeEmbedder(), brain.embedding_settings(config))
+        try:
+            stats = brain.build(self.c)
+            self.assertGreater(stats['embedded'], 0)
+            lexical_rows = brain.search_rows(self.c, 'rarequery', limit=5)
+            semantic_rows = brain.search_rows(self.c, 'unmatchedquery', limit=5)
+            self.assertEqual(lexical_rows[0][4], 'rarequery reference')
+            self.assertEqual(semantic_rows[0][4], 'Semantic candidate')
+            report = brain.check(self.c)
+            self.assertEqual(report['embedding_missing'], 0)
+            self.assertEqual(report['orphan_embeddings'], 0)
+            self.assertEqual(report['invalid_embeddings'], 0)
+            semantic.unlink()
+            brain.build(self.c)
+            report = brain.check(self.c)
+            self.assertEqual(report['orphan_embeddings'], 0)
+            con = brain.sqlite3.connect(str(brain.db_path(self.c)))
+            self.assertEqual(con.execute('SELECT count(*) FROM embeddings').fetchone()[0],
+                             con.execute('SELECT count(*) FROM chunks').fetchone()[0])
+            con.close()
+        finally:
+            brain._get_embedder = original_get_embedder
+
 if __name__=='__main__': unittest.main()

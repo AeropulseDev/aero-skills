@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Small stdlib-only FTS index for manuals, handoffs, map, workflows and KB text."""
+"""Local FTS index with optional FastEmbed vector search (no inference API)."""
 import argparse
 import contextlib
 import datetime as dt
 import hashlib
 import io
 import json
+import math
 import re
 import sqlite3
+import struct
 import sys
 import time
 from pathlib import Path
@@ -16,7 +18,10 @@ VALID_KINDS = frozenset(("manual", "handoff", "kb", "map", "wf", "issue", "todo"
 SCHEMA = """CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, kind TEXT NOT NULL, sha TEXT NOT NULL, mtime REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY,path TEXT NOT NULL,kind TEXT NOT NULL,heading TEXT NOT NULL,line_from INTEGER NOT NULL,line_to INTEGER NOT NULL,date TEXT,text TEXT NOT NULL,stem TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(heading,stem,content='chunks',content_rowid='id',tokenize='unicode61');
-CREATE TABLE IF NOT EXISTS links(chunk_id INTEGER NOT NULL,ref_kind TEXT NOT NULL,ref_id TEXT NOT NULL,UNIQUE(chunk_id,ref_kind,ref_id));"""
+CREATE TABLE IF NOT EXISTS links(chunk_id INTEGER NOT NULL,ref_kind TEXT NOT NULL,ref_id TEXT NOT NULL,UNIQUE(chunk_id,ref_kind,ref_id));
+CREATE TABLE IF NOT EXISTS embeddings(chunk_id INTEGER NOT NULL,model TEXT NOT NULL,dimension INTEGER NOT NULL,vector BLOB NOT NULL,PRIMARY KEY(chunk_id,model));"""
+DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBEDDER_CACHE = {}
 DATE_RE = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)")
 WORD_RE = re.compile(r"[\w][\w_-]*", re.UNICODE)
 ENDINGS = ("иями", "ами", "ого", "ему", "ому", "ими", "ыми", "ов", "ев", "ей", "ам", "ям", "ах", "ях", "ы", "и", "а", "я", "о", "е", "у", "ю")
@@ -175,12 +180,107 @@ def config_load(path):
     for source in config.get("sources", []):
         if source.get("kind") not in VALID_KINDS:
             raise ValueError("unknown source kind: %s" % source.get("kind"))
+    embedding_settings(config)
     return config
 
 
 def source_root(config, source):
     root = Path(source["root"])
     return root if root.is_absolute() else config["_dir"] / root
+
+
+def embedding_settings(config):
+    settings = config.get("embeddings", {})
+    if not isinstance(settings, dict):
+        raise ValueError("embeddings config must be an object")
+    enabled = settings.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise ValueError("embeddings.enabled must be boolean")
+    if not enabled:
+        return None
+    model = settings.get("model", DEFAULT_EMBEDDING_MODEL)
+    if not isinstance(model, str) or not model.strip():
+        raise ValueError("embeddings.model must be a non-empty model name")
+    allow_download = settings.get("allow_model_download", False)
+    if not isinstance(allow_download, bool):
+        raise ValueError("embeddings.allow_model_download must be boolean")
+    cache_value = settings.get("cache_dir", ".venv/model-cache")
+    if not isinstance(cache_value, str) or not cache_value.strip():
+        raise ValueError("embeddings.cache_dir must be a non-empty path")
+    cache_dir = Path(cache_value)
+    if not cache_dir.is_absolute():
+        cache_dir = config["_dir"] / cache_dir
+    try:
+        threads = int(settings.get("threads", 1))
+        semantic_weight = float(settings.get("semantic_weight", 2.0))
+        lexical_weight = float(settings.get("lexical_weight", 1.0))
+    except (TypeError, ValueError):
+        raise ValueError("embedding threads and weights must be numbers")
+    if (threads < 1 or not math.isfinite(semantic_weight) or not math.isfinite(lexical_weight)
+            or semantic_weight <= 0 or lexical_weight <= 0):
+        raise ValueError("embedding threads and weights must be finite and positive")
+    return {
+        "model": model.strip(), "cache_dir": cache_dir.resolve(), "threads": threads,
+        "allow_model_download": allow_download,
+        "query_prefix": str(settings.get("query_prefix", "")),
+        "document_prefix": str(settings.get("document_prefix", "")),
+        "semantic_weight": semantic_weight, "lexical_weight": lexical_weight,
+    }
+
+
+def _embedding_key(settings):
+    return "%s|q=%s|d=%s" % (settings["model"], settings["query_prefix"], settings["document_prefix"])
+
+
+def _get_embedder(config):
+    settings = embedding_settings(config)
+    if settings is None:
+        return None, None
+    key = (_embedding_key(settings), str(settings["cache_dir"]), settings["threads"], settings["allow_model_download"])
+    if key not in EMBEDDER_CACHE:
+        try:
+            from fastembed import TextEmbedding
+        except ImportError as exc:
+            raise ValueError("local embeddings need FastEmbed; install brain-aero/requirements-embeddings.txt") from exc
+        try:
+            EMBEDDER_CACHE[key] = TextEmbedding(
+                model_name=settings["model"], cache_dir=str(settings["cache_dir"]),
+                threads=settings["threads"], providers=["CPUExecutionProvider"],
+                local_files_only=not settings["allow_model_download"],
+            )
+        except Exception as exc:
+            action = "enable embeddings.allow_model_download once to fetch weights" if not settings["allow_model_download"] else "check model name and local cache"
+            raise ValueError("cannot load local embedding model %s; %s: %s" % (settings["model"], action, exc)) from exc
+    return EMBEDDER_CACHE[key], settings
+
+
+def _vector(value):
+    if hasattr(value, "tolist"):
+        value = value.tolist()
+    values = tuple(float(x) for x in value)
+    if not values or any(not math.isfinite(x) for x in values):
+        raise ValueError("embedding vector is empty or non-finite")
+    return values
+
+
+def _pack_vector(values):
+    values = _vector(values)
+    return len(values), struct.pack("<%sf" % len(values), *values)
+
+
+def _unpack_vector(dimension, blob):
+    if dimension < 1 or len(blob) != dimension * 4:
+        raise ValueError("embedding vector has invalid size")
+    return struct.unpack("<%sf" % dimension, blob)
+
+
+def _cosine(left, right):
+    if len(left) != len(right):
+        raise ValueError("embedding dimensions do not match")
+    dot = math.fsum(a * b for a, b in zip(left, right))
+    left_norm = math.sqrt(math.fsum(a * a for a in left))
+    right_norm = math.sqrt(math.fsum(b * b for b in right))
+    return dot / (left_norm * right_norm) if left_norm and right_norm else 0.0
 
 
 def source_files(config):
@@ -298,13 +398,17 @@ def issue_chunks(path, invalid_dates=None):
 
 
 def issue_snapshot(path):
-    """Hash the same stable database contents that were parsed into chunks."""
+    """Read and hash parsed rows, including SQLite WAL-visible changes."""
     for _ in range(3):
-        before = Path(path).read_bytes()
         chunks = issue_chunks(path)
-        after = Path(path).read_bytes()
-        if before == after:
-            return chunks, hashlib.sha256(before).hexdigest()
+        # Hash the exact parsed representation rather than the main .db bytes:
+        # loop-watch may be using WAL, where updates live in -wal and the main
+        # file's bytes/mtime stay unchanged.
+        payload = json.dumps(chunks, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        again = issue_chunks(path)
+        payload_again = json.dumps(again, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+        if payload == payload_again:
+            return chunks, hashlib.sha256(payload).hexdigest()
     raise ValueError("issue database changed while it was being indexed: %s" % path)
 
 
@@ -378,11 +482,33 @@ def _map_assets(config):
     return set()
 
 
+def _populate_embeddings(connection, embedder, settings):
+    model = _embedding_key(settings)
+    missing = connection.execute(
+        "SELECT c.id,c.heading,c.text FROM chunks c LEFT JOIN embeddings e "
+        "ON e.chunk_id=c.id AND e.model=? WHERE e.chunk_id IS NULL ORDER BY c.id", (model,)
+    ).fetchall()
+    embedded = 0
+    for offset in range(0, len(missing), 32):
+        batch = missing[offset:offset + 32]
+        documents = [settings["document_prefix"] + row[1] + "\n" + row[2] for row in batch]
+        vectors = list(embedder.embed(documents, batch_size=32))
+        if len(vectors) != len(batch):
+            raise ValueError("embedding runtime returned a different vector count")
+        for row, vector in zip(batch, vectors):
+            dimension, blob = _pack_vector(vector)
+            connection.execute("INSERT OR REPLACE INTO embeddings VALUES(?,?,?,?)",
+                               (row[0], model, dimension, blob))
+            embedded += 1
+    return embedded
+
+
 def build(config, full=False, verbose=False):
+    embedder, embed_settings = _get_embedder(config)
     database = db_path(config)
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(str(database))
-    result = {"indexed": 0, "unchanged": 0, "removed": 0, "errors": 0}
+    result = {"indexed": 0, "unchanged": 0, "removed": 0, "errors": 0, "embedded": 0}
     seen = {}
     unavailable = unavailable_sources(config)
     assets = _map_assets(config)
@@ -427,6 +553,7 @@ def build(config, full=False, verbose=False):
                 old_ids = [row[0] for row in connection.execute("SELECT id FROM chunks WHERE path=?", (key,))]
                 if old_ids:
                     connection.executemany("DELETE FROM links WHERE chunk_id=?", [(item,) for item in old_ids])
+                    connection.executemany("DELETE FROM embeddings WHERE chunk_id=?", [(item,) for item in old_ids])
                 connection.execute("DELETE FROM chunks WHERE path=?", (key,))
                 connection.execute("DELETE FROM files WHERE path=?", (key,))
                 result["errors"] += 1
@@ -434,6 +561,7 @@ def build(config, full=False, verbose=False):
             old_ids = [row[0] for row in connection.execute("SELECT id FROM chunks WHERE path=?", (key,))]
             if old_ids:
                 connection.executemany("DELETE FROM links WHERE chunk_id=?", [(item,) for item in old_ids])
+                connection.executemany("DELETE FROM embeddings WHERE chunk_id=?", [(item,) for item in old_ids])
             connection.execute("DELETE FROM chunks WHERE path=?", (key,))
             connection.execute("DELETE FROM files WHERE path=?", (key,))
             connection.execute("INSERT INTO files VALUES(?,?,?,?)", (key, kind, digest, mtime))
@@ -450,9 +578,12 @@ def build(config, full=False, verbose=False):
                 ids = [row[0] for row in connection.execute("SELECT id FROM chunks WHERE path=?", (path,))]
                 if ids:
                     connection.executemany("DELETE FROM links WHERE chunk_id=?", [(item,) for item in ids])
+                    connection.executemany("DELETE FROM embeddings WHERE chunk_id=?", [(item,) for item in ids])
                 connection.execute("DELETE FROM chunks WHERE path=?", (path,))
                 connection.execute("DELETE FROM files WHERE path=?", (path,))
                 result["removed"] += 1
+        if embedder is not None:
+            result["embedded"] = _populate_embeddings(connection, embedder, embed_settings)
         connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
         connection.commit()
     except Exception:
@@ -461,7 +592,10 @@ def build(config, full=False, verbose=False):
     finally:
         connection.close()
     if verbose:
-        print("indexed={indexed} unchanged={unchanged} removed={removed} errors={errors}".format(**result))
+        message = "indexed={indexed} unchanged={unchanged} removed={removed} errors={errors}".format(**result)
+        if embedder is not None:
+            message += " embedded=%d" % result["embedded"]
+        print(message)
     return result
 
 
@@ -471,6 +605,19 @@ def fts_query(query, synonyms):
     for word in words:
         expanded.extend(normalize_word(item) for item in synonyms.get(word, []))
     return " OR ".join('"%s"' % item.replace('"', '""') for item in dict.fromkeys(expanded) if item) or '""'
+
+
+def fts_query_all(query, synonyms):
+    groups = []
+    for raw in WORD_RE.findall(query):
+        word = normalize_word(raw)
+        if len(word) < 3 and not any(char.isdigit() for char in word):
+            continue
+        alternatives = [word] + [normalize_word(item) for item in synonyms.get(word, [])]
+        tokens = list(dict.fromkeys(item for item in alternatives if item))
+        if tokens:
+            groups.append("(" + " OR ".join('"%s"' % item.replace('"', '""') for item in tokens) + ")")
+    return " AND ".join(groups) if groups else fts_query(query, synonyms)
 
 
 def _validate_find(kinds, since):
@@ -500,15 +647,55 @@ def display_path(config, stored):
     return stored
 
 
+def _fts_search_rows(connection, config, query, kinds, since, limit, fresh, open_todo, require_all=False):
+    sql = ("SELECT c.id,c.kind,c.path,c.line_from,c.line_to,c.heading,c.text,bm25(chunks_fts,3.0,1.0),c.date "
+           "FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.rowid WHERE chunks_fts MATCH ?")
+    synonyms = {normalize_word(k): v for k, v in config.get("synonyms", {}).items()}
+    match = fts_query_all(query, synonyms) if require_all else fts_query(query, synonyms)
+    args = [match]
+    if kinds:
+        sql += " AND c.kind IN (%s)" % ",".join("?" * len(kinds))
+        args.extend(kinds)
+    if since:
+        sql += " AND c.date>=?"
+        args.append(since)
+    if open_todo:
+        sql += " AND c.heading LIKE '%[ ]%'"
+    sql += " ORDER BY " + ("c.date DESC,8,c.kind,c.path,c.line_from" if fresh else "8,c.kind,c.path,c.line_from")
+    sql += " LIMIT ?"
+    return [(row[0], row[1:]) for row in connection.execute(sql, args + [limit]).fetchall()]
+
+
 def search_rows(config, query, kinds=None, since=None, limit=8, fresh=False, open_todo=False):
     _validate_find(kinds, since)
     if limit < 1:
         raise ValueError("result limit must be positive")
     connection = sqlite3.connect(str(db_path(config)))
     try:
-        sql = ("SELECT c.kind,c.path,c.line_from,c.line_to,c.heading,c.text,bm25(chunks_fts,3.0,1.0),c.date "
-               "FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.rowid WHERE chunks_fts MATCH ?")
-        args = [fts_query(query, {normalize_word(k): v for k, v in config.get("synonyms", {}).items()})]
+        settings = embedding_settings(config)
+        fetch_limit = max(200, limit * 20) if settings else limit
+        lexical = _fts_search_rows(connection, config, query, kinds, since, fetch_limit, fresh, open_todo)
+        if settings is None:
+            return [row for _, row in lexical[:limit]]
+        full_lexical = _fts_search_rows(connection, config, query, kinds, since, limit, fresh, open_todo,
+                                        require_all=True)
+        lexical_prefix = lexical[:limit] if full_lexical else lexical[:1]
+        full_ids = {ident for ident, _ in lexical_prefix}
+        if len(lexical_prefix) >= limit:
+            return [row for _, row in lexical_prefix[:limit]]
+
+        embedder, settings = _get_embedder(config)
+        has_embeddings = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
+        ).fetchone() is not None
+        if not has_embeddings:
+            raise ValueError("embedding table is missing; run brain.py build with embeddings enabled")
+        model = _embedding_key(settings)
+        query_text = settings["query_prefix"] + query
+        query_vector = _vector(next(iter(embedder.query_embed(query_text))))
+        sql = ("SELECT c.id,c.kind,c.path,c.line_from,c.line_to,c.heading,c.text,c.date,e.dimension,e.vector "
+               "FROM embeddings e JOIN chunks c ON c.id=e.chunk_id WHERE e.model=?")
+        args = [model]
         if kinds:
             sql += " AND c.kind IN (%s)" % ",".join("?" * len(kinds))
             args.extend(kinds)
@@ -517,9 +704,40 @@ def search_rows(config, query, kinds=None, since=None, limit=8, fresh=False, ope
             args.append(since)
         if open_todo:
             sql += " AND c.heading LIKE '%[ ]%'"
-        sql += " ORDER BY " + ("c.date DESC,7,c.kind,c.path,c.line_from" if fresh else "7,c.kind,c.path,c.line_from")
-        sql += " LIMIT ?"
-        return connection.execute(sql, args + [limit]).fetchall()
+        vectors = connection.execute(sql, args).fetchall()
+        if not vectors:
+            raise ValueError("no vectors for configured model; run brain.py build with embeddings enabled")
+        semantic = []
+        for item in vectors:
+            row = (item[1], item[2], item[3], item[4], item[5], item[6], 0.0, item[7])
+            score = _cosine(query_vector, _unpack_vector(item[8], item[9]))
+            semantic.append((item[0], score, row))
+        semantic.sort(key=lambda item: (-item[1], item[2][0], item[2][1], item[2][2], item[0]))
+        semantic = semantic[:max(200, limit * 20)]
+        semantic_rank = {ident: rank for rank, (ident, _, _) in enumerate(semantic, 1)}
+        lexical_rank = {ident: rank for rank, (ident, _) in enumerate(lexical, 1)}
+        rows_by_id = {ident: row for ident, row in lexical}
+        rows_by_id.update({ident: row for ident, _, row in semantic})
+        candidates = []
+        for ident, row in rows_by_id.items():
+            score = 0.0
+            if ident in semantic_rank:
+                score += settings["semantic_weight"] / (60.0 + semantic_rank[ident])
+            if ident in lexical_rank:
+                score += settings["lexical_weight"] / (60.0 + lexical_rank[ident])
+            candidates.append((ident, row, score))
+        candidates.sort(key=lambda item: (item[1][0], item[1][1], item[1][2], item[0]))
+        candidates.sort(key=lambda item: item[2], reverse=True)
+        if fresh:
+            candidates.sort(key=lambda item: item[1][7] or "", reverse=True)
+        result = [row for _, row in full_lexical[:limit]]
+        for ident, row, score in candidates:
+            if ident in full_ids:
+                continue
+            result.append(row[:6] + (-score, row[7]))
+            if len(result) >= limit:
+                break
+        return result
     finally:
         connection.close()
 
@@ -680,23 +898,29 @@ def node(config, ident):
 def stats(config):
     database = db_path(config)
     if not database.exists():
-        print("files=0 chunks=0 links=0")
+        print("files=0 chunks=0 links=0 embeddings=0 models=0")
         return
     connection = sqlite3.connect(str(database))
     try:
         files = connection.execute("SELECT count(*) FROM files").fetchone()[0]
         chunks = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
         links = connection.execute("SELECT count(*) FROM links").fetchone()[0]
+        has_embeddings = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
+        ).fetchone() is not None
+        embeddings = connection.execute("SELECT count(*) FROM embeddings").fetchone()[0] if has_embeddings else 0
+        models = connection.execute("SELECT count(DISTINCT model) FROM embeddings").fetchone()[0] if has_embeddings else 0
     finally:
         connection.close()
-    print("files=%d chunks=%d links=%d" % (files, chunks, links))
+    print("files=%d chunks=%d links=%d embeddings=%d models=%d" % (files, chunks, links, embeddings, models))
 
 
 def check(config):
     unavailable = unavailable_sources(config)
     report = {"duplicates": 0, "invalid_utf8": 0, "invalid_dates": 0, "invalid_issue_db": 0,
               "missing_sources": len(unavailable), "unknown_kinds": 0,
-              "integrity": "missing", "fts_integrity": "missing", "orphan_links": 0}
+              "integrity": "missing", "fts_integrity": "missing", "orphan_links": 0,
+              "embedding_rows": 0, "orphan_embeddings": 0, "invalid_embeddings": 0, "embedding_missing": 0}
     seen = set()
     checked_text = set()
     for source in config.get("sources", []):
@@ -735,10 +959,39 @@ def check(config):
                 connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
                 report["fts_integrity"] = "ok"
             except sqlite3.DatabaseError as exc:
-                report["fts_integrity"] = str(exc)
+                # FTS5's integrity command writes transient state. A database
+                # opened read-only (or concurrently locked) cannot run it;
+                # report that limitation without turning a healthy DB check
+                # into a confusing failure.
+                message = str(exc)
+                if "readonly" in message.lower() or "locked" in message.lower():
+                    report["fts_integrity"] = "not-run: " + message
+                else:
+                    report["fts_integrity"] = message
             report["orphan_links"] = connection.execute(
                 "SELECT count(*) FROM links l LEFT JOIN chunks c ON c.id=l.chunk_id WHERE c.id IS NULL"
             ).fetchone()[0]
+            has_embeddings = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
+            ).fetchone() is not None
+            settings = embedding_settings(config)
+            if has_embeddings:
+                report["embedding_rows"] = connection.execute("SELECT count(*) FROM embeddings").fetchone()[0]
+                report["orphan_embeddings"] = connection.execute(
+                    "SELECT count(*) FROM embeddings e LEFT JOIN chunks c ON c.id=e.chunk_id WHERE c.id IS NULL"
+                ).fetchone()[0]
+                report["invalid_embeddings"] = connection.execute(
+                    "SELECT count(*) FROM embeddings WHERE dimension<1 OR length(vector)!=dimension*4"
+                ).fetchone()[0]
+            if settings is not None:
+                model = _embedding_key(settings)
+                if has_embeddings:
+                    report["embedding_missing"] = connection.execute(
+                        "SELECT count(*) FROM chunks c LEFT JOIN embeddings e "
+                        "ON e.chunk_id=c.id AND e.model=? WHERE e.chunk_id IS NULL", (model,)
+                    ).fetchone()[0]
+                else:
+                    report["embedding_missing"] = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
         finally:
             connection.close()
     return report

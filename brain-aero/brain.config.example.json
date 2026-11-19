@@ -8,6 +8,15 @@
     {"kind": "issue", "root": "../loop-watch/watch.db"}
   ],
   "database": "brain.db",
+  "embeddings": {
+    "enabled": false,
+    "model": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "cache_dir": ".venv/model-cache",
+    "allow_model_download": false,
+    "threads": 1,
+    "semantic_weight": 2.0,
+    "lexical_weight": 1.0
+  },
   "synonyms": {
     "пинг": ["ping"],
     "сотрудники": ["работники", "люди"],

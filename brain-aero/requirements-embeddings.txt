@@ -1,0 +1,2 @@
+# Optional CPU-only local embeddings; the default FTS5 path has no third-party dependencies.
+fastembed==0.9.1
