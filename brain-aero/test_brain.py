@@ -21,4 +21,23 @@ class BrainTests(unittest.TestCase):
     def test_chunks_and_safe_queries(self):
         brain.build(self.c); con=brain.sqlite3.connect(str(brain.db_path(self.c))); rows=con.execute('select heading,line_from,line_to from chunks where kind="manual"').fetchall(); con.close(); self.assertEqual(rows[0][0],'BPMSoft ping'); self.assertEqual(rows[0][1],1); self.assertEqual(rows[0][2],2); brain.find(self.c,'"T-010": x-y',limit=5)
 
+    def test_check_and_validated_filters(self):
+        (self.root/'manuals'/'bad-2024-02-31.md').write_bytes(b'# bad 2024-02-31\n')
+        # overlap the manual source to verify duplicate detection without duplicate rows
+        self.c['sources'].append({'kind':'manual','root':'manuals','glob':'*.md'})
+        brain.build(self.c)
+        report = brain.check(self.c)
+        self.assertEqual(report['invalid_dates'], 1)
+        self.assertGreaterEqual(report['duplicates'], 1)
+        with self.assertRaises(ValueError): brain.find(self.c, 'ping', kinds=['bogus'])
+        with self.assertRaises(ValueError): brain.find(self.c, 'ping', since='2024-02-31')
+
+    def test_invalid_utf8_removes_stale(self):
+        p = self.root/'kb'/'broken.txt'; p.write_text('searchable', encoding='utf-8'); brain.build(self.c)
+        p.write_bytes(b'\xff'); stats = brain.build(self.c)
+        self.assertEqual(stats['errors'], 1)
+        con = brain.sqlite3.connect(str(brain.db_path(self.c)))
+        self.assertEqual(con.execute('select count(*) from files where path like ?', ('%broken.txt',)).fetchone()[0], 0)
+        con.close()
+
 if __name__=='__main__': unittest.main()

@@ -1,96 +1,497 @@
 #!/usr/bin/env python3
-"""Small stdlib-only FTS index for manuals, handoffs and knowledge-base text."""
-import argparse, hashlib, json, re, sqlite3, sys
+"""Small stdlib-only FTS index for manuals, handoffs, map, workflows and KB text."""
+import argparse
+import contextlib
+import datetime as dt
+import hashlib
+import io
+import json
+import re
+import sqlite3
+import sys
 from pathlib import Path
-SCHEMA="""CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, kind TEXT NOT NULL, sha TEXT NOT NULL, mtime REAL NOT NULL);CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY,path TEXT NOT NULL,kind TEXT NOT NULL,heading TEXT NOT NULL,line_from INTEGER NOT NULL,line_to INTEGER NOT NULL,date TEXT,text TEXT NOT NULL,stem TEXT NOT NULL);CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(heading,stem,content='chunks',content_rowid='id',tokenize='unicode61');"""
-DATE_RE=re.compile(r"(20\d{2}-\d{2}-\d{2})"); WORD_RE=re.compile(r"[\w][\w_-]*",re.UNICODE); ENDINGS=("иями","ами","ого","ему","ому","ими","ыми","ов","ев","ей","ам","ям","ах","ях","ы","и","а","я","о","е","у","ю")
+
+VALID_KINDS = frozenset(("manual", "handoff", "kb", "map", "wf"))
+SCHEMA = """CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, kind TEXT NOT NULL, sha TEXT NOT NULL, mtime REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY,path TEXT NOT NULL,kind TEXT NOT NULL,heading TEXT NOT NULL,line_from INTEGER NOT NULL,line_to INTEGER NOT NULL,date TEXT,text TEXT NOT NULL,stem TEXT NOT NULL);
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(heading,stem,content='chunks',content_rowid='id',tokenize='unicode61');
+CREATE TABLE IF NOT EXISTS links(chunk_id INTEGER NOT NULL,ref_kind TEXT NOT NULL,ref_id TEXT NOT NULL,UNIQUE(chunk_id,ref_kind,ref_id));"""
+DATE_RE = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)")
+WORD_RE = re.compile(r"[\w][\w_-]*", re.UNICODE)
+ENDINGS = ("иями", "ами", "ого", "ему", "ому", "ими", "ыми", "ов", "ев", "ей", "ам", "ям", "ах", "ях", "ы", "и", "а", "я", "о", "е", "у", "ю")
+
+
 def normalize_word(w):
- w=w.lower().replace("ё","е")
- if len(w)>=5 and not ("_" in w or any(c.isdigit() for c in w) or re.search(r"[a-z]",w)):
-  for e in ENDINGS:
-   if w.endswith(e) and len(w)-len(e)>=4:return w[:-len(e)]
- return w
-def stem_text(t):return " ".join(normalize_word(x) for x in WORD_RE.findall(t))
-def read_utf8(p):
- try:return p.read_text(encoding="utf-8").replace("\r\n","\n").replace("\r","\n")
- except UnicodeDecodeError as e:raise ValueError("UTF-8 decode failed for %s: %s"%(p,e))
-def date_for(p,t):
- m=DATE_RE.search(p.name) or DATE_RE.search(t[:500]);return m.group(1) if m else None
-def markdown_chunks(p,kind):
- t=read_utf8(p); lines=t.splitlines(); heads=[]; fenced=False
- for i,line in enumerate(lines):
-  if re.match(r"^\s*(```|~~~)",line):fenced=not fenced;continue
-  m=re.match(r"^(#{1,6})\s+(.+?)\s*$",line)
-  if m and not fenced:heads.append((i,m.group(2).strip()))
- out=[]
- if heads:
-  for n,(s,h) in enumerate(heads):
-   e=heads[n+1][0] if n+1<len(heads) else len(lines); body="\n".join(lines[s:e]).strip()
-   if body:out.append((h,s+1,e,date_for(p,t),body))
- elif t.strip():out.append((p.stem,1,len(lines),date_for(p,t),t.strip()))
- return out
-def kb_chunks(p):
- t=read_utf8(p)
- if p.suffix.lower() in (".md",".markdown"):return markdown_chunks(p,"kb")
- return [(p.stem,i+1,i+1,date_for(p,t),line.strip()) for i,line in enumerate(t.splitlines()) if line.strip()]
+    w = w.lower().replace("ё", "е")
+    if len(w) >= 5 and not ("_" in w or any(c.isdigit() for c in w) or re.search(r"[a-z]", w)):
+        for ending in ENDINGS:
+            if w.endswith(ending) and len(w) - len(ending) >= 4:
+                return w[:-len(ending)]
+    return w
+
+
+def stem_text(text):
+    return " ".join(normalize_word(x) for x in WORD_RE.findall(text))
+
+
+def read_utf8(path):
+    try:
+        return path.read_text(encoding="utf-8").replace("\r\n", "\n").replace("\r", "\n")
+    except UnicodeDecodeError as exc:
+        raise ValueError("UTF-8 decode failed for %s: %s" % (path, exc))
+
+
+def strict_date(value):
+    try:
+        dt.date.fromisoformat(value)
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
+def date_for(path, text):
+    for value in DATE_RE.findall(path.name) + DATE_RE.findall(text[:500]):
+        if strict_date(value):
+            return value
+    return None
+
+
+def date_values(path, text):
+    values = DATE_RE.findall(path.name) + DATE_RE.findall(text[:500])
+    return values, [value for value in values if not strict_date(value)]
+
+
+def markdown_chunks(path, kind):
+    text = read_utf8(path)
+    lines = text.splitlines()
+    headings, fenced = [], False
+    for index, line in enumerate(lines):
+        if re.match(r"^\s*(```|~~~)", line):
+            fenced = not fenced
+            continue
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*$", line)
+        if match and not fenced:
+            headings.append((index, match.group(2).strip()))
+    chunks = []
+    if headings:
+        for number, (start, heading) in enumerate(headings):
+            end = headings[number + 1][0] if number + 1 < len(headings) else len(lines)
+            body = "\n".join(lines[start:end]).strip()
+            if body:
+                chunks.append((heading, start + 1, end, date_for(path, text), body))
+    elif text.strip():
+        chunks.append((path.stem, 1, len(lines), date_for(path, text), text.strip()))
+    return chunks
+
+
+def kb_chunks(path):
+    text = read_utf8(path)
+    if path.suffix.lower() in (".md", ".markdown"):
+        return markdown_chunks(path, "kb")
+    return [(path.stem, index + 1, index + 1, date_for(path, text), line.strip())
+            for index, line in enumerate(text.splitlines()) if line.strip()]
+
+
+def _split_pipe(line):
+    return [item.strip() for item in line.split("|")]
+
+
+def wf_chunks(path):
+    """Index workflow metadata and individual records, especially [steps]."""
+    text = read_utf8(path)
+    lines, section, rows = text.splitlines(), None, {}
+    for number, raw in enumerate(lines, 1):
+        line = raw.strip()
+        match = re.match(r"^\[(\w+)\]$", line)
+        if match:
+            section = match.group(1)
+            continue
+        if not line or line.startswith("#"):
+            continue
+        rows.setdefault(section or "?", []).append((number, line))
+    chunks, date = [], date_for(path, text)
+    for name, records in rows.items():
+        if name == "meta":
+            chunks.append((path.stem + " meta", records[0][0], records[-1][0], date,
+                           "\n".join(item[1] for item in records)))
+            continue
+        for line_number, line in records:
+            fields = _split_pipe(line)
+            record_id = fields[0] if fields else ""
+            label = fields[3] if name == "steps" and len(fields) > 3 else (fields[1] if len(fields) > 1 else line[:80])
+            chunks.append((f"{path.stem} {name} {record_id} {label}".strip(), line_number, line_number, date, line))
+    return chunks
+
+
+def _pm_for(root):
+    scripts = str(Path(root) / "scripts")
+    if scripts not in sys.path:
+        sys.path.insert(0, scripts)
+    import pm
+    return pm
+
+
+def map_snapshot(root):
+    root = Path(root)
+    raw, mtime = b"", 0
+    files = [root / "map.txt"] + sorted((root / "parts").glob("*.txt"))
+    for path in files:
+        if path.exists():
+            raw += path.name.encode() + b"\0" + path.read_bytes()
+            mtime = max(mtime, path.stat().st_mtime)
+    return raw, mtime
+
+
+def map_chunks(root):
+    """Build map chunks through infocenter.scripts.pm.load(), never a second parser."""
+    root = Path(root).resolve()
+    pm = _pm_for(root)
+    old_root = pm.ROOT
+    try:
+        pm.ROOT = root
+        model = pm.load()
+    finally:
+        pm.ROOT = old_root
+    flows_by_asset = {}
+    for flow in model["flows"]:
+        for asset_id in (flow["src"], flow["dst"]):
+            flows_by_asset.setdefault(asset_id, []).append(pm.fl(flow))
+    chunks = []
+    for asset_id, asset in model["assets"].items():
+        lines = [f"{asset_id} | {asset['type']} | {asset['name']} | {asset['a']}"]
+        lines.extend(flows_by_asset.get(asset_id, ()))
+        where = asset.get("where", "map.txt:1")
+        match = re.match(r"(.+):(\d+)$", where)
+        line_number = int(match.group(2)) if match else 1
+        chunks.append((f"{asset_id} {asset['name']}", line_number, line_number, None, "\n".join(lines)))
+    return chunks
+
+
 def config_load(path):
- p=Path(path).resolve();d=json.loads(p.read_text(encoding="utf-8"));d["_dir"]=p.parent;return d
-def source_files(c):
- for s in c.get("sources",[]):
-  r=Path(s["root"]);r=r if r.is_absolute() else c["_dir"]/r
-  if not r.exists():print("warning: source missing: %s"%r,file=sys.stderr);continue
-  for p in r.glob(s.get("glob","**/*")):
-   if p.is_file():yield s["kind"],r,p
-def parse_file(k,p):return kb_chunks(p) if k=="kb" else markdown_chunks(p,k)
-def db_path(c):
- p=Path(c.get("database","brain.db"));return p if p.is_absolute() else c["_dir"]/p
-def build(c,full=False,verbose=False):
- dbp=db_path(c);dbp.parent.mkdir(parents=True,exist_ok=True);con=sqlite3.connect(str(dbp));stats={"indexed":0,"unchanged":0,"removed":0,"errors":0}
- try:
-  con.executescript(SCHEMA);con.execute("BEGIN");seen={}
-  for k,r,p in source_files(c):
-   key="%s:%s"%(k,p.resolve());raw=p.read_bytes();sha=hashlib.sha256(raw).hexdigest();mt=p.stat().st_mtime;seen[key]=(k,sha,mt);old=con.execute("SELECT sha,mtime FROM files WHERE path=?",(key,)).fetchone()
-   if not full and old and old[0]==sha and old[1]==mt:stats["unchanged"]+=1;continue
-   try:chunks=parse_file(k,p)
-   except (OSError,ValueError) as e:print("warning: %s"%e,file=sys.stderr);stats["errors"]+=1;continue
-   con.execute("DELETE FROM chunks WHERE path=? AND kind=?",(key,k));con.execute("DELETE FROM files WHERE path=? AND kind=?",(key,k));con.execute("INSERT INTO files VALUES(?,?,?,?)",(key,k,sha,mt))
-   for h,a,b,d,t in chunks:con.execute("INSERT INTO chunks(path,kind,heading,line_from,line_to,date,text,stem) VALUES(?,?,?,?,?,?,?,?)",(key,k,h,a,b,d,t,stem_text(h+" "+t)))
-   stats["indexed"]+=1
-  for p,k in con.execute("SELECT path,kind FROM files").fetchall():
-   if p not in seen:con.execute("DELETE FROM chunks WHERE path=? AND kind=?",(p,k));con.execute("DELETE FROM files WHERE path=? AND kind=?",(p,k));stats["removed"]+=1
-  con.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')");con.commit()
- except Exception:
-  con.rollback();raise
- finally:con.close()
- if verbose:print("indexed={indexed} unchanged={unchanged} removed={removed} errors={errors}".format(**stats))
- return stats
-def fts_query(q,syn):
- w=[normalize_word(x) for x in WORD_RE.findall(q)];e=list(w)
- for x in w:e += [normalize_word(a) for a in syn.get(x,[])]
- return " OR ".join('"%s"'%x.replace('"','""') for x in dict.fromkeys(e) if x) or '""'
-def find(c,q,kinds=None,since=None,limit=8):
- con=sqlite3.connect(str(db_path(c)))
- try:
-  sql="SELECT c.kind,c.path,c.line_from,c.line_to,c.heading,c.text,bm25(chunks_fts,3.0,1.0),c.date FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.rowid WHERE chunks_fts MATCH ?";a=[fts_query(q,{normalize_word(k):v for k,v in c.get("synonyms",{}).items()})]
-  if kinds:sql+=" AND c.kind IN (%s)"%",".join("?"*len(kinds));a+=list(kinds)
-  if since:sql+=" AND (c.date IS NULL OR c.date>=?)";a.append(since)
-  sql += " ORDER BY 7,c.kind,c.path,c.line_from LIMIT ?"
-  rows=con.execute(sql,a+[limit]).fetchall()
- finally:con.close()
- for k,p,x,y,h,t,_,_ in rows:print("%s | %s:%s-%s | %s | %s"%(k,p,x,y,h," ".join(t.split())[:240]))
- return rows
-def stats(c):
- p=db_path(c)
- if not p.exists():print("files=0 chunks=0");return
- con=sqlite3.connect(str(p));f=con.execute("SELECT count(*) FROM files").fetchone()[0];n=con.execute("SELECT count(*) FROM chunks").fetchone()[0];con.close();print("files=%d chunks=%d"%(f,n))
+    path = Path(path).resolve()
+    config = json.loads(path.read_text(encoding="utf-8-sig"))
+    config["_dir"] = path.parent
+    for source in config.get("sources", []):
+        if source.get("kind") not in VALID_KINDS:
+            raise ValueError("unknown source kind: %s" % source.get("kind"))
+    return config
+
+
+def source_root(config, source):
+    root = Path(source["root"])
+    return root if root.is_absolute() else config["_dir"] / root
+
+
+def source_files(config):
+    for source in config.get("sources", []):
+        root = source_root(config, source)
+        if not root.exists():
+            print("warning: source missing: %s" % root, file=sys.stderr)
+            continue
+        if source["kind"] == "map":
+            if (root / "map.txt").exists():
+                yield "map", root, root / "map.txt"
+            else:
+                print("warning: map source missing map.txt: %s" % root, file=sys.stderr)
+            continue
+        for path in root.glob(source.get("glob", "**/*")):
+            if path.is_file():
+                yield source["kind"], root, path
+
+
+def parse_file(kind, path, root=None):
+    if kind == "map":
+        return map_chunks(root or path.parent)
+    if kind == "wf":
+        return wf_chunks(path)
+    return kb_chunks(path) if kind == "kb" else markdown_chunks(path, kind)
+
+
+def db_path(config):
+    path = Path(config.get("database", "brain.db"))
+    return path if path.is_absolute() else config["_dir"] / path
+
+
+def canonical_key(kind, path):
+    return "%s:%s" % (kind, Path(path).resolve())
+
+
+def _refs(kind, path, heading, text, assets):
+    refs = []
+    if kind == "wf":
+        filename = str(path).replace("\\", "/").rsplit("/", 1)[-1]
+        refs.append(("wf", filename.rsplit(".", 2)[0]))
+    content = heading + "\n" + text
+    for asset_id in assets:
+        if re.search(r"(?<![\w-])" + re.escape(asset_id) + r"(?![\w-])", content):
+            refs.append(("asset", asset_id))
+    for pattern, ref_kind in ((r"\bR-\d+\b", "rule"), (r"\bT-\d+\b", "todo"), (r"(?<!\w)#(\d+)\b", "issue")):
+        refs.extend((ref_kind, value if ref_kind != "issue" else "#" + value)
+                    for value in re.findall(pattern, content, re.I))
+    return refs
+
+
+def _map_assets(config):
+    for source in config.get("sources", []):
+        if source.get("kind") == "map":
+            try:
+                root = source_root(config, source).resolve()
+                pm = _pm_for(root)
+                old_root = pm.ROOT
+                try:
+                    pm.ROOT = root
+                    return set(pm.load()["assets"])
+                finally:
+                    pm.ROOT = old_root
+            except Exception:
+                return set()
+    return set()
+
+
+def build(config, full=False, verbose=False):
+    database = db_path(config)
+    database.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(str(database))
+    result = {"indexed": 0, "unchanged": 0, "removed": 0, "errors": 0}
+    seen = {}
+    assets = _map_assets(config)
+    try:
+        connection.executescript(SCHEMA)
+        connection.execute("BEGIN")
+        for kind, root, path in source_files(config):
+            if kind == "map":
+                raw, mtime = map_snapshot(root)
+                key, parse_root = canonical_key(kind, root), root
+            else:
+                raw, mtime = path.read_bytes(), path.stat().st_mtime
+                key, parse_root = canonical_key(kind, path), None
+            digest = hashlib.sha256(raw).hexdigest()
+            seen[key] = (kind, digest, mtime)
+            old = connection.execute("SELECT sha,mtime FROM files WHERE path=?", (key,)).fetchone()
+            if not full and old and old[0] == digest and old[1] == mtime:
+                result["unchanged"] += 1
+                continue
+            try:
+                chunks = parse_file(kind, path, parse_root)
+            except (OSError, ValueError, ImportError) as exc:
+                print("warning: %s" % exc, file=sys.stderr)
+                old_ids = [row[0] for row in connection.execute("SELECT id FROM chunks WHERE path=?", (key,))]
+                if old_ids:
+                    connection.executemany("DELETE FROM links WHERE chunk_id=?", [(item,) for item in old_ids])
+                connection.execute("DELETE FROM chunks WHERE path=?", (key,))
+                connection.execute("DELETE FROM files WHERE path=?", (key,))
+                result["errors"] += 1
+                continue
+            old_ids = [row[0] for row in connection.execute("SELECT id FROM chunks WHERE path=?", (key,))]
+            if old_ids:
+                connection.executemany("DELETE FROM links WHERE chunk_id=?", [(item,) for item in old_ids])
+            connection.execute("DELETE FROM chunks WHERE path=?", (key,))
+            connection.execute("DELETE FROM files WHERE path=?", (key,))
+            connection.execute("INSERT INTO files VALUES(?,?,?,?)", (key, kind, digest, mtime))
+            for heading, line_from, line_to, date, text in chunks:
+                cursor = connection.execute(
+                    "INSERT INTO chunks(path,kind,heading,line_from,line_to,date,text,stem) VALUES(?,?,?,?,?,?,?,?)",
+                    (key, kind, heading, line_from, line_to, date, text, stem_text(heading + " " + text)),
+                )
+                for ref_kind, ref_id in dict.fromkeys(_refs(kind, key, heading, text, assets)):
+                    connection.execute("INSERT OR IGNORE INTO links VALUES(?,?,?)", (cursor.lastrowid, ref_kind, ref_id))
+            result["indexed"] += 1
+        for path, kind in connection.execute("SELECT path,kind FROM files").fetchall():
+            if path not in seen:
+                ids = [row[0] for row in connection.execute("SELECT id FROM chunks WHERE path=?", (path,))]
+                if ids:
+                    connection.executemany("DELETE FROM links WHERE chunk_id=?", [(item,) for item in ids])
+                connection.execute("DELETE FROM chunks WHERE path=?", (path,))
+                connection.execute("DELETE FROM files WHERE path=?", (path,))
+                result["removed"] += 1
+        connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+    if verbose:
+        print("indexed={indexed} unchanged={unchanged} removed={removed} errors={errors}".format(**result))
+    return result
+
+
+def fts_query(query, synonyms):
+    words = [normalize_word(item) for item in WORD_RE.findall(query)]
+    expanded = list(words)
+    for word in words:
+        expanded.extend(normalize_word(item) for item in synonyms.get(word, []))
+    return " OR ".join('"%s"' % item.replace('"', '""') for item in dict.fromkeys(expanded) if item) or '""'
+
+
+def _validate_find(kinds, since):
+    if kinds:
+        unknown = set(kinds) - VALID_KINDS
+        if unknown:
+            raise ValueError("unknown kind: %s" % ", ".join(sorted(unknown)))
+    if since is not None and not strict_date(since):
+        raise ValueError("invalid --since date: %s" % since)
+
+
+def display_path(config, stored):
+    if ":" not in stored:
+        return stored
+    kind, absolute = stored.split(":", 1)
+    path = Path(absolute)
+    for source in config.get("sources", []):
+        if source.get("kind") != kind:
+            continue
+        root = source_root(config, source).resolve()
+        try:
+            return "%s:%s" % (kind, path.relative_to(root))
+        except ValueError:
+            pass
+    return stored
+
+
+def find(config, query, kinds=None, since=None, limit=8):
+    _validate_find(kinds, since)
+    connection = sqlite3.connect(str(db_path(config)))
+    try:
+        sql = ("SELECT c.kind,c.path,c.line_from,c.line_to,c.heading,c.text,bm25(chunks_fts,3.0,1.0),c.date "
+               "FROM chunks_fts JOIN chunks c ON c.id=chunks_fts.rowid WHERE chunks_fts MATCH ?")
+        args = [fts_query(query, {normalize_word(k): v for k, v in config.get("synonyms", {}).items()})]
+        if kinds:
+            sql += " AND c.kind IN (%s)" % ",".join("?" * len(kinds))
+            args.extend(kinds)
+        if since:
+            sql += " AND (c.date IS NULL OR c.date>=?)"
+            args.append(since)
+        sql += " ORDER BY 7,c.kind,c.path,c.line_from LIMIT ?"
+        rows = connection.execute(sql, args + [limit]).fetchall()
+    finally:
+        connection.close()
+    for kind, path, line_from, line_to, heading, text, _, _ in rows:
+        print("%s | %s:%s-%s | %s | %s" % (kind, display_path(config, path), line_from, line_to, heading, " ".join(text.split())[:240]))
+    return rows
+
+
+def node(config, ident):
+    connection = sqlite3.connect(str(db_path(config)))
+    try:
+        rows = connection.execute(
+            "SELECT c.kind,c.path,c.line_from,c.line_to,c.heading,c.text FROM links l JOIN chunks c ON c.id=l.chunk_id "
+            "WHERE l.ref_kind='asset' AND l.ref_id=? ORDER BY c.kind,c.path,c.line_from", (ident,)
+        ).fetchall()
+    finally:
+        connection.close()
+    map_sources = [source for source in config.get("sources", []) if source.get("kind") == "map"]
+    if map_sources:
+        try:
+            root = source_root(config, map_sources[0]).resolve()
+            pm = _pm_for(root)
+            old_root = pm.ROOT
+            try:
+                pm.ROOT = root
+                model = pm.load()
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    pm.query(model, ["node", ident])
+                if output.getvalue().strip():
+                    print(output.getvalue().rstrip())
+            finally:
+                pm.ROOT = old_root
+        except Exception as exc:
+            print("map node unavailable: %s" % exc, file=sys.stderr)
+    print("--- связанные фрагменты:")
+    for kind, path, line_from, line_to, heading, text in rows:
+        print("%s | %s:%s-%s | %s | %s" % (kind, display_path(config, path), line_from, line_to, heading, " ".join(text.split())[:240]))
+    return rows
+
+
+def stats(config):
+    database = db_path(config)
+    if not database.exists():
+        print("files=0 chunks=0 links=0")
+        return
+    connection = sqlite3.connect(str(database))
+    try:
+        files = connection.execute("SELECT count(*) FROM files").fetchone()[0]
+        chunks = connection.execute("SELECT count(*) FROM chunks").fetchone()[0]
+        links = connection.execute("SELECT count(*) FROM links").fetchone()[0]
+    finally:
+        connection.close()
+    print("files=%d chunks=%d links=%d" % (files, chunks, links))
+
+
+def check(config):
+    report = {"duplicates": 0, "invalid_utf8": 0, "invalid_dates": 0, "unknown_kinds": 0,
+              "integrity": "missing", "fts_integrity": "missing", "orphan_links": 0}
+    seen = set()
+    checked_text = set()
+    for source in config.get("sources", []):
+        if source.get("kind") not in VALID_KINDS:
+            report["unknown_kinds"] += 1
+            continue
+        for kind, root, path in source_files(dict(config, sources=[source])):
+            key = canonical_key(kind, root if kind == "map" else path)
+            if key in seen:
+                report["duplicates"] += 1
+            seen.add(key)
+            if key in checked_text:
+                continue
+            checked_text.add(key)
+            try:
+                text = read_utf8(path) if kind != "map" else ""
+            except (OSError, ValueError):
+                report["invalid_utf8"] += 1
+                continue
+            _, invalid = date_values(path, text)
+            report["invalid_dates"] += len(set(invalid))
+    database = db_path(config)
+    if database.exists():
+        connection = sqlite3.connect(str(database))
+        try:
+            report["integrity"] = connection.execute("PRAGMA integrity_check").fetchone()[0]
+            try:
+                connection.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('integrity-check')")
+                report["fts_integrity"] = "ok"
+            except sqlite3.DatabaseError as exc:
+                report["fts_integrity"] = str(exc)
+            report["orphan_links"] = connection.execute(
+                "SELECT count(*) FROM links l LEFT JOIN chunks c ON c.id=l.chunk_id WHERE c.id IS NULL"
+            ).fetchone()[0]
+        finally:
+            connection.close()
+    return report
+
+
 def main(argv=None):
- a=argparse.ArgumentParser();s=a.add_subparsers(dest="cmd",required=True)
- for n in("build","stats"):
-  p=s.add_parser(n);p.add_argument("--config",default="brain.config.json")
-  if n=="build":p.add_argument("--full",action="store_true");p.add_argument("--verbose",action="store_true")
- p=s.add_parser("find");p.add_argument("query");p.add_argument("--config",default="brain.config.json");p.add_argument("--kind",action="append");p.add_argument("--since");p.add_argument("-n",type=int,default=8)
- x=a.parse_args(argv);c=config_load(x.config)
- if x.cmd=="build":build(c,x.full,x.verbose)
- elif x.cmd=="stats":stats(c)
- else:find(c,x.query,x.kind,x.since,x.n)
-if __name__=="__main__":main()
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("build", "stats", "check"):
+        command = sub.add_parser(name)
+        command.add_argument("--config", default="brain.config.json")
+        if name == "build":
+            command.add_argument("--full", action="store_true")
+            command.add_argument("--verbose", action="store_true")
+    command = sub.add_parser("find")
+    command.add_argument("query")
+    command.add_argument("--config", default="brain.config.json")
+    command.add_argument("--kind", action="append")
+    command.add_argument("--since")
+    command.add_argument("-n", type=int, default=8)
+    command = sub.add_parser("node")
+    command.add_argument("id")
+    command.add_argument("--config", default="brain.config.json")
+    args = parser.parse_args(argv)
+    config = config_load(args.config)
+    if args.cmd == "build":
+        build(config, args.full, args.verbose)
+    elif args.cmd == "stats":
+        stats(config)
+    elif args.cmd == "check":
+        print(json.dumps(check(config), ensure_ascii=False, sort_keys=True))
+    elif args.cmd == "node":
+        node(config, args.id)
+    else:
+        find(config, args.query, args.kind, args.since, args.n)
+
+
+if __name__ == "__main__":
+    main()
