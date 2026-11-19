@@ -15,7 +15,8 @@
     "allow_model_download": false,
     "threads": 1,
     "semantic_weight": 2.0,
-    "lexical_weight": 1.0
+    "lexical_weight": 1.0,
+    "semantic_pool": {"manual": 1, "handoff": 1}
   },
   "synonyms": {
     "пинг": ["ping"],

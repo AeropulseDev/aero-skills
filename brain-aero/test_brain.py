@@ -12,6 +12,30 @@ class BrainTests(unittest.TestCase):
         self.cfg = self.root/'cfg.json'; self.cfg.write_text(json.dumps({'sources':[{'kind':'manual','root':'manuals','glob':'*.md'},{'kind':'handoff','root':'handoffs','glob':'*.md'},{'kind':'kb','root':'kb','glob':'**/*'}], 'database':'brain.db','synonyms':{'пинг':['ping']}}), encoding='utf-8')
         self.c = brain.config_load(self.cfg)
     def tearDown(self): self.td.cleanup()
+
+    def test_eval_filters_to_expected_source(self):
+        wanted = ('manual', str(self.root/'manuals'/'BPMSOFT_PING_SETUP.md'), 1, 1,
+                  'BPMSoft ping', 'text', 0.0, None)
+        distractor = ('handoff', str(self.root/'handoffs'/'h.md'), 1, 1,
+                      'unrelated heading', 'unrelated text', 0.0, None)
+        seen = []
+
+        def fake_search_rows(config, query, kinds=None, limit=8, **kwargs):
+            seen.append((kinds, limit))
+            return [wanted] if kinds == ['manual'] else [distractor]
+
+        eval_file = self.root/'eval.txt'
+        eval_file.write_text('K | manual:BPMSOFT_PING_SETUP.md#BPMSoft ping | ping setup\n', encoding='utf-8')
+        original_search_rows = brain.search_rows
+        brain.search_rows = fake_search_rows
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                result = brain.evaluate(self.c, eval_file)
+        finally:
+            brain.search_rows = original_search_rows
+        self.assertEqual(seen, [(['manual'], 5)])
+        self.assertEqual(result['manual']['K'], [1, 1])
+
     def test_build_find_incremental_delete(self):
         s=brain.build(self.c); self.assertEqual(s['indexed'],3)
         self.assertGreaterEqual(len(brain.find(self.c,'пинг BPMSoft',limit=3)),1)
@@ -172,6 +196,50 @@ class BrainTests(unittest.TestCase):
             self.assertEqual(con.execute('SELECT count(*) FROM embeddings').fetchone()[0],
                              con.execute('SELECT count(*) FROM chunks').fetchone()[0])
             con.close()
+        finally:
+            brain._get_embedder = original_get_embedder
+
+    def test_manual_semantic_pool_keeps_nearest_only(self):
+        (self.root/'manuals'/'lexical.md').write_text('# lexical hit\nrarequery exact term\n', encoding='utf-8')
+        (self.root/'manuals'/'nearest.md').write_text('# nearest meaning\nunrelated words\n', encoding='utf-8')
+        (self.root/'manuals'/'second.md').write_text('# second meaning\nalso unrelated\n', encoding='utf-8')
+        self.c['embeddings'] = {
+            'enabled': True, 'model': 'fixture-model', 'cache_dir': 'model-cache',
+            'semantic_weight': 100.0, 'lexical_weight': 1.0,
+        }
+        settings = brain.embedding_settings(self.c)
+        self.assertEqual(settings['semantic_pool']['manual'], 1)
+        self.assertEqual(settings['semantic_pool']['handoff'], 1)
+        self.assertNotIn('map', settings['semantic_pool'])
+        self.c['embeddings']['semantic_pool'] = {'bogus': 1}
+        with self.assertRaises(ValueError):
+            brain.embedding_settings(self.c)
+        self.c['embeddings']['semantic_pool'] = {'manual': 1}
+
+        class FakeEmbedder:
+            def embed(self, documents, batch_size=32):
+                vectors = []
+                for text in documents:
+                    if 'nearest meaning' in text:
+                        vectors.append([1.0, 0.0])
+                    elif 'second meaning' in text:
+                        vectors.append([0.8, 0.2])
+                    else:
+                        vectors.append([0.0, 1.0])
+                return vectors
+
+            def query_embed(self, query):
+                return [[1.0, 0.0]]
+
+        original_get_embedder = brain._get_embedder
+        brain._get_embedder = lambda config: (FakeEmbedder(), brain.embedding_settings(config))
+        try:
+            brain.build(self.c)
+            narrow = brain.search_rows(self.c, 'rarequery', kinds=['manual'], limit=2)
+            self.assertEqual([row[4] for row in narrow], ['nearest meaning', 'lexical hit'])
+            self.c['embeddings']['semantic_pool'] = {'manual': 2}
+            wide = brain.search_rows(self.c, 'rarequery', kinds=['manual'], limit=2)
+            self.assertEqual([row[4] for row in wide], ['nearest meaning', 'second meaning'])
         finally:
             brain._get_embedder = original_get_embedder
 

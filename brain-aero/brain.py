@@ -21,6 +21,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(heading,stem,content='c
 CREATE TABLE IF NOT EXISTS links(chunk_id INTEGER NOT NULL,ref_kind TEXT NOT NULL,ref_id TEXT NOT NULL,UNIQUE(chunk_id,ref_kind,ref_id));
 CREATE TABLE IF NOT EXISTS embeddings(chunk_id INTEGER NOT NULL,model TEXT NOT NULL,dimension INTEGER NOT NULL,vector BLOB NOT NULL,PRIMARY KEY(chunk_id,model));"""
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+# Long texts: only the nearest semantic neighbor may compete with lexical hits.
+# Map nodes and other short kinds keep the full candidate pool.
+DEFAULT_SEMANTIC_POOL = {"manual": 1, "handoff": 1}
 EMBEDDER_CACHE = {}
 DATE_RE = re.compile(r"(?<!\d)(20\d{2}-\d{2}-\d{2})(?!\d)")
 WORD_RE = re.compile(r"[\w][\w_-]*", re.UNICODE)
@@ -225,7 +228,23 @@ def embedding_settings(config):
         "query_prefix": str(settings.get("query_prefix", "")),
         "document_prefix": str(settings.get("document_prefix", "")),
         "semantic_weight": semantic_weight, "lexical_weight": lexical_weight,
+        "semantic_pool": _semantic_pool(settings.get("semantic_pool")),
     }
+
+
+def _semantic_pool(raw):
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("embeddings.semantic_pool must be an object")
+    pool = dict(DEFAULT_SEMANTIC_POOL)
+    for kind, value in raw.items():
+        if kind not in VALID_KINDS:
+            raise ValueError("unknown semantic_pool kind: %s" % kind)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("embeddings.semantic_pool values must be positive integers")
+        pool[kind] = value
+    return pool
 
 
 def _embedding_key(settings):
@@ -710,10 +729,22 @@ def search_rows(config, query, kinds=None, since=None, limit=8, fresh=False, ope
             semantic.append((item[0], score, row))
         semantic.sort(key=lambda item: (-item[1], item[2][0], item[2][1], item[2][2], item[0]))
         semantic = semantic[:max(200, limit * 20)]
-        semantic_rank = {ident: rank for rank, (ident, _, _) in enumerate(semantic, 1)}
+        # Rank stays global so a single-kind search matches the measured gate.
+        # The pool drops extra neighbors of long-text kinds before they can outrank a lexical hit.
+        pool = settings["semantic_pool"]
+        within_kind = {}
+        kept_semantic = []
+        for rank, (ident, _, row) in enumerate(semantic, 1):
+            kind = row[0]
+            within_kind[kind] = within_kind.get(kind, 0) + 1
+            kind_pool = pool.get(kind)
+            if kind_pool is not None and within_kind[kind] > kind_pool:
+                continue
+            kept_semantic.append((ident, rank, row))
+        semantic_rank = {ident: rank for ident, rank, _ in kept_semantic}
         lexical_rank = {ident: rank for rank, (ident, _) in enumerate(lexical, 1)}
         rows_by_id = {ident: row for ident, row in lexical}
-        rows_by_id.update({ident: row for ident, _, row in semantic})
+        rows_by_id.update({ident: row for ident, _, row in kept_semantic})
         candidates = []
         for ident, row in rows_by_id.items():
             score = 0.0
@@ -832,7 +863,8 @@ def evaluate(config, path, top_n=5):
             raise ValueError("invalid eval source, target, or query at %s:%d" % (path, line_number))
         bucket = totals.setdefault(source, {"K": [0, 0], "P": [0, 0]})[group]
         bucket[1] += 1
-        rows = search_rows(config, query, limit=top_n)
+        # Compare with the source-specific baseline, not against unrelated kinds.
+        rows = search_rows(config, query, kinds=[source], limit=top_n)
         bucket[0] += int(any(_matches_expected(config, row, expected) for row in rows))
     print("источник      brain-aero K       brain-aero P       baseline method / K / P")
     for source in ("map", "manual", "handoff", "issue", "todo", "kb", "wf"):
