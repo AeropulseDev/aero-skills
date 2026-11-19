@@ -1,0 +1,15 @@
+{
+  "sources": [
+    {"kind": "manual", "root": "../../aeroassist/manuals", "glob": "*.md"},
+    {"kind": "handoff", "root": "../../Agents_projects_reg", "glob": "**/*.md"},
+    {"kind": "kb", "root": "../../infocenter/kb", "glob": "**/*"}
+  ],
+  "database": "brain.db",
+  "synonyms": {
+    "пинг": ["ping"],
+    "сотрудники": ["работники", "люди"],
+    "бронировщик": ["букер"],
+    "crm": ["BPMSoft"],
+    "завис": ["висел"]
+  }
+}

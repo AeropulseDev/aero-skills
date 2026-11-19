@@ -18,3 +18,9 @@ Thumbs.db
 skills-index/registry.closed.md
 skills-index/registry.closed.path
 skills-index/INDEX.built.md
+
+# brain-aero local derived data and user config
+brain-aero/brain.config.json
+brain-aero/brain.db
+brain-aero/brain.db-*
+brain-aero/eval.txt
