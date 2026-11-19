@@ -4,7 +4,8 @@
     {"kind": "handoff", "root": "../../Agents_projects_reg", "glob": "**/*.md"},
     {"kind": "kb", "root": "../../infocenter/kb", "glob": "**/*"},
     {"kind": "map", "root": "../../infocenter"},
-    {"kind": "wf", "root": "../../infocenter/wf", "glob": "*.wf.txt"}
+    {"kind": "wf", "root": "../../infocenter/wf", "glob": "*.wf.txt"},
+    {"kind": "issue", "root": "../loop-watch/watch.db"}
   ],
   "database": "brain.db",
   "synonyms": {

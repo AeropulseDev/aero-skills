@@ -9,9 +9,10 @@ import json
 import re
 import sqlite3
 import sys
+import time
 from pathlib import Path
 
-VALID_KINDS = frozenset(("manual", "handoff", "kb", "map", "wf"))
+VALID_KINDS = frozenset(("manual", "handoff", "kb", "map", "wf", "issue", "todo"))
 SCHEMA = """CREATE TABLE IF NOT EXISTS files(path TEXT PRIMARY KEY, kind TEXT NOT NULL, sha TEXT NOT NULL, mtime REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS chunks(id INTEGER PRIMARY KEY,path TEXT NOT NULL,kind TEXT NOT NULL,heading TEXT NOT NULL,line_from INTEGER NOT NULL,line_to INTEGER NOT NULL,date TEXT,text TEXT NOT NULL,stem TEXT NOT NULL);
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(heading,stem,content='chunks',content_rowid='id',tokenize='unicode61');
@@ -194,9 +195,134 @@ def source_files(config):
             else:
                 print("warning: map source missing map.txt: %s" % root, file=sys.stderr)
             continue
+        if source["kind"] in ("issue", "todo"):
+            if root.is_file():
+                yield source["kind"], root.parent, root
+                continue
+            default_glob = "watch.db" if source["kind"] == "issue" else "**/*"
+            pattern = source.get("glob", default_glob)
+            found = False
+            for path in root.glob(pattern):
+                if path.is_file():
+                    found = True
+                    yield source["kind"], root, path
+            if not found:
+                print("warning: %s source has no matching files (%s): %s" %
+                      (source["kind"], pattern, root), file=sys.stderr)
+            continue
         for path in root.glob(source.get("glob", "**/*")):
             if path.is_file():
                 yield source["kind"], root, path
+
+
+def unavailable_sources(config):
+    """Roots that are configured but temporarily absent; retain their old chunks."""
+    unavailable = []
+    for source in config.get("sources", []):
+        kind = source["kind"]
+        root = source_root(config, source).resolve()
+        missing = not root.exists()
+        if not missing and kind == "map":
+            missing = not (root / "map.txt").is_file()
+        if not missing and kind in ("issue", "todo") and root.is_dir():
+            pattern = source.get("glob", "watch.db" if kind == "issue" else "**/*")
+            missing = not any(path.is_file() for path in root.glob(pattern))
+        if missing:
+            unavailable.append((kind, root))
+    return unavailable
+
+
+def _under_root(path, root):
+    if path == root:
+        return True
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _retained_for_unavailable(stored, kind, unavailable):
+    stored_kind, _, absolute = stored.partition(":")
+    if stored_kind != kind:
+        return False
+    candidate = Path(absolute).resolve()
+    return any(missing_kind == kind and _under_root(candidate, root)
+               for missing_kind, root in unavailable)
+
+
+def _read_issue_rows(path):
+    """Read a stable SQLite snapshot; the connection is read-only and query-only."""
+    uri = Path(path).resolve().as_uri() + "?mode=ro"
+    for attempt in range(3):
+        connection = None
+        try:
+            connection = sqlite3.connect(uri, uri=True, timeout=1)
+            connection.execute("PRAGMA query_only=ON")
+            connection.execute("BEGIN")
+            return connection.execute(
+                "SELECT id,kind,repo,num,title,created,body FROM events "
+                "WHERE lower(kind) IN ('issue','comment') ORDER BY id"
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            reason = str(exc).lower()
+            if attempt < 2 and ("locked" in reason or "busy" in reason):
+                time.sleep(0.2 * (attempt + 1))
+                continue
+            raise ValueError("cannot read issue database %s: %s" % (path, exc))
+        except sqlite3.DatabaseError as exc:
+            raise ValueError("invalid issue database %s: %s" % (path, exc))
+        finally:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.DatabaseError:
+                    pass
+                connection.close()
+
+
+def issue_chunks(path, invalid_dates=None):
+    """Read loop-watch events without opening its database for writes."""
+    rows = _read_issue_rows(path)
+    chunks = []
+    for ident, kind, repo, number, title, created, body in rows:
+        title = (title or "").strip()
+        label = "comment" if str(kind).lower() == "comment" else "issue"
+        heading = "%s#%s %s %s" % (repo or "", number or "?", label, title)
+        content = "\n".join(part for part in (title, (body or "").strip()) if part)
+        date = str(created)[:10] if created and strict_date(str(created)[:10]) else None
+        if created and not date and invalid_dates is not None:
+            invalid_dates.append(str(created))
+        chunks.append((heading.strip(), int(ident), int(ident), date, content or heading))
+    return chunks
+
+
+def issue_snapshot(path):
+    """Hash the same stable database contents that were parsed into chunks."""
+    for _ in range(3):
+        before = Path(path).read_bytes()
+        chunks = issue_chunks(path)
+        after = Path(path).read_bytes()
+        if before == after:
+            return chunks, hashlib.sha256(before).hexdigest()
+    raise ValueError("issue database changed while it was being indexed: %s" % path)
+
+
+def todo_chunks(path):
+    """Index one UTF-8 checklist record per task, preserving its T-number."""
+    text = read_utf8(path)
+    chunks = []
+    task_re = re.compile(r"^\s*-\s+\[([ xX])\]\s+(T-\d+)\s*[·|–-]?\s*(.*)$")
+    for number, raw in enumerate(text.splitlines(), 1):
+        match = task_re.match(raw)
+        if not match:
+            continue
+        state, task_id, rest = match.groups()
+        status = "x" if state.strip().lower() == "x" else " "
+        heading = "%s [%s] %s" % (task_id, status, rest.strip())
+        line = raw.strip()
+        chunks.append((heading.strip(), number, number, date_for(path, line), line))
+    return chunks
 
 
 def parse_file(kind, path, root=None):
@@ -204,6 +330,10 @@ def parse_file(kind, path, root=None):
         return map_chunks(root or path.parent)
     if kind == "wf":
         return wf_chunks(path)
+    if kind == "issue":
+        return issue_chunks(path)
+    if kind == "todo":
+        return todo_chunks(path)
     return kb_chunks(path) if kind == "kb" else markdown_chunks(path, kind)
 
 
@@ -254,6 +384,7 @@ def build(config, full=False, verbose=False):
     connection = sqlite3.connect(str(database))
     result = {"indexed": 0, "unchanged": 0, "removed": 0, "errors": 0}
     seen = {}
+    unavailable = unavailable_sources(config)
     assets = _map_assets(config)
     try:
         connection.executescript(SCHEMA)
@@ -262,19 +393,37 @@ def build(config, full=False, verbose=False):
             if kind == "map":
                 raw, mtime = map_snapshot(root)
                 key, parse_root = canonical_key(kind, root), root
+                chunks = None
+            elif kind == "issue":
+                key, parse_root = canonical_key(kind, path), None
+                try:
+                    chunks, digest = issue_snapshot(path)
+                    mtime = path.stat().st_mtime
+                except (OSError, ValueError, ImportError) as exc:
+                    print("warning: %s" % exc, file=sys.stderr)
+                    seen[key] = (kind, None, path.stat().st_mtime if path.exists() else 0)
+                    result["errors"] += 1
+                    continue
+                raw = None
             else:
                 raw, mtime = path.read_bytes(), path.stat().st_mtime
                 key, parse_root = canonical_key(kind, path), None
-            digest = hashlib.sha256(raw).hexdigest()
+                chunks = None
+            if kind != "issue":
+                digest = hashlib.sha256(raw).hexdigest()
             seen[key] = (kind, digest, mtime)
             old = connection.execute("SELECT sha,mtime FROM files WHERE path=?", (key,)).fetchone()
             if not full and old and old[0] == digest and old[1] == mtime:
                 result["unchanged"] += 1
                 continue
             try:
-                chunks = parse_file(kind, path, parse_root)
+                if chunks is None:
+                    chunks = parse_file(kind, path, parse_root)
             except (OSError, ValueError, ImportError) as exc:
                 print("warning: %s" % exc, file=sys.stderr)
+                if kind == "issue":
+                    result["errors"] += 1
+                    continue
                 old_ids = [row[0] for row in connection.execute("SELECT id FROM chunks WHERE path=?", (key,))]
                 if old_ids:
                     connection.executemany("DELETE FROM links WHERE chunk_id=?", [(item,) for item in old_ids])
@@ -297,7 +446,7 @@ def build(config, full=False, verbose=False):
                     connection.execute("INSERT OR IGNORE INTO links VALUES(?,?,?)", (cursor.lastrowid, ref_kind, ref_id))
             result["indexed"] += 1
         for path, kind in connection.execute("SELECT path,kind FROM files").fetchall():
-            if path not in seen:
+            if path not in seen and not _retained_for_unavailable(path, kind, unavailable):
                 ids = [row[0] for row in connection.execute("SELECT id FROM chunks WHERE path=?", (path,))]
                 if ids:
                     connection.executemany("DELETE FROM links WHERE chunk_id=?", [(item,) for item in ids])
@@ -342,6 +491,8 @@ def display_path(config, stored):
         if source.get("kind") != kind:
             continue
         root = source_root(config, source).resolve()
+        if root.is_file() and path.resolve() == root:
+            return "%s:%s" % (kind, path.name)
         try:
             return "%s:%s" % (kind, path.relative_to(root))
         except ValueError:
@@ -349,8 +500,10 @@ def display_path(config, stored):
     return stored
 
 
-def find(config, query, kinds=None, since=None, limit=8):
+def search_rows(config, query, kinds=None, since=None, limit=8, fresh=False, open_todo=False):
     _validate_find(kinds, since)
+    if limit < 1:
+        raise ValueError("result limit must be positive")
     connection = sqlite3.connect(str(db_path(config)))
     try:
         sql = ("SELECT c.kind,c.path,c.line_from,c.line_to,c.heading,c.text,bm25(chunks_fts,3.0,1.0),c.date "
@@ -360,15 +513,135 @@ def find(config, query, kinds=None, since=None, limit=8):
             sql += " AND c.kind IN (%s)" % ",".join("?" * len(kinds))
             args.extend(kinds)
         if since:
-            sql += " AND (c.date IS NULL OR c.date>=?)"
+            sql += " AND c.date>=?"
             args.append(since)
-        sql += " ORDER BY 7,c.kind,c.path,c.line_from LIMIT ?"
-        rows = connection.execute(sql, args + [limit]).fetchall()
+        if open_todo:
+            sql += " AND c.heading LIKE '%[ ]%'"
+        sql += " ORDER BY " + ("c.date DESC,7,c.kind,c.path,c.line_from" if fresh else "7,c.kind,c.path,c.line_from")
+        sql += " LIMIT ?"
+        return connection.execute(sql, args + [limit]).fetchall()
     finally:
         connection.close()
+
+
+def find(config, query, kinds=None, since=None, limit=8):
+    rows = search_rows(config, query, kinds, since, limit)
     for kind, path, line_from, line_to, heading, text, _, _ in rows:
         print("%s | %s:%s-%s | %s | %s" % (kind, display_path(config, path), line_from, line_to, heading, " ".join(text.split())[:240]))
     return rows
+
+
+def _todo_priority(row):
+    match = re.search(r"\bP([1-3])\b", row[4] + " " + row[5])
+    return int(match.group(1)) if match else 4
+
+
+def brief(config, query, limit=8):
+    """Compact topical digest: recent issue/handoff context plus open TODOs."""
+    if limit < 1:
+        raise ValueError("result limit must be positive")
+    rows = []
+    for kind in ("issue", "handoff", "todo"):
+        rows.extend(search_rows(config, query, (kind,), limit=1000,
+                               fresh=kind in ("issue", "handoff"), open_todo=kind == "todo"))
+    candidates = {kind: [row for row in rows if row[0] == kind] for kind in ("issue", "handoff", "todo")}
+    for kind in ("issue", "handoff"):
+        candidates[kind].sort(key=lambda row: row[6])
+        candidates[kind].sort(key=lambda row: row[7] or "", reverse=True)
+    candidates["todo"].sort(key=lambda row: (_todo_priority(row), row[6]))
+    quota = max(1, (limit + 2) // 3)
+    selected = []
+    for kind in ("issue", "handoff", "todo"):
+        selected.extend(candidates[kind][:quota])
+    selected_ids = {(row[0], row[1], row[2]) for row in selected}
+    remaining = [row for kind in ("issue", "handoff", "todo") for row in candidates[kind]
+                 if (row[0], row[1], row[2]) not in selected_ids]
+    remaining.sort(key=lambda row: row[6])
+    selected.extend(remaining[:max(0, limit - len(selected))])
+    selected = selected[:limit]
+    for kind, path, line_from, line_to, heading, text, _, date in selected:
+        print("%s | %s | %s:%s-%s | %s | %s" % (
+            date or "date?", kind, display_path(config, path), line_from, line_to,
+            heading, " ".join(text.split())[:240]))
+    return selected
+
+
+def _matches_expected(config, row, expected):
+    source, target = expected.split(":", 1)
+    kind, path, _, _, heading, text, _, _ = row
+    if source != kind:
+        return False
+    normalized_path = display_path(config, path).split(":", 1)[-1].replace("\\", "/").lower()
+    if kind == "map":
+        return heading.split(" ", 1)[0].lower() == target.lower()
+    if kind == "issue":
+        match = re.fullmatch(r"(.+?)#(\d+)", target)
+        return bool(match and heading.split(" ", 1)[0].lower() ==
+                    (match.group(1) + "#" + match.group(2)).lower())
+    if kind == "todo" and re.fullmatch(r"T-\d+", target, re.I):
+        ids = {value.upper() for value in re.findall(r"(?<![\w-])T-\d+(?!\w)", heading + " " + text, re.I)}
+        return target.upper() in ids
+    path_target, marker, section = target.partition("#") if kind in ("manual", "handoff") else (target, "", "")
+    path_target = path_target.replace("\\", "/").lower()
+    location_ok = normalized_path.endswith(path_target) or Path(normalized_path).name == Path(path_target).name
+    return location_ok and (not marker or section.lower() in heading.lower())
+
+
+def _eval_ratio(value, path, line_number):
+    match = re.fullmatch(r"(\d+)/(\d+)", value)
+    if not match:
+        raise ValueError("invalid baseline ratio at %s:%d" % (path, line_number))
+    hits, count = map(int, match.groups())
+    if count < 1 or hits > count:
+        raise ValueError("invalid baseline count at %s:%d" % (path, line_number))
+    return [hits, count]
+
+
+def evaluate(config, path, top_n=5):
+    """Evaluate K/P rows; optional comment rows store eval_baseline.py results."""
+    if top_n < 1:
+        raise ValueError("eval top_n must be positive")
+    totals, baselines = {}, {}
+    for line_number, raw in enumerate(read_utf8(path).splitlines(), 1):
+        line = raw.strip()
+        if line.startswith("# baseline|"):
+            fields = [item.strip() for item in line[2:].split("|")]
+            if len(fields) != 5 or fields[1] not in VALID_KINDS or not fields[2]:
+                raise ValueError("invalid baseline row at %s:%d" % (path, line_number))
+            key = (fields[1], fields[2])
+            if key in baselines:
+                raise ValueError("duplicate baseline method at %s:%d" % (path, line_number))
+            baselines[key] = {"K": _eval_ratio(fields[3], path, line_number),
+                              "P": _eval_ratio(fields[4], path, line_number)}
+            continue
+        if not line or line.startswith("#"):
+            continue
+        fields = [item.strip() for item in line.split("|", 2)]
+        if (len(fields) != 3 or fields[0] not in ("K", "P") or ":" not in fields[1]):
+            raise ValueError("invalid eval row at %s:%d" % (path, line_number))
+        group, expected, query = fields
+        source, target = expected.split(":", 1)
+        if source not in VALID_KINDS or not target or not query:
+            raise ValueError("invalid eval source, target, or query at %s:%d" % (path, line_number))
+        bucket = totals.setdefault(source, {"K": [0, 0], "P": [0, 0]})[group]
+        bucket[1] += 1
+        rows = search_rows(config, query, limit=top_n)
+        bucket[0] += int(any(_matches_expected(config, row, expected) for row in rows))
+    print("источник      brain-aero K       brain-aero P       baseline method / K / P")
+    for source in ("map", "manual", "handoff", "issue", "todo", "kb", "wf"):
+        if source not in totals:
+            continue
+        def cell(values):
+            hits, count = values
+            return "%d/%d %d%%" % (hits, count, (100 * hits // count) if count else 0)
+        k, p = totals[source]["K"], totals[source]["P"]
+        methods = [(method, result) for (kind, method), result in baselines.items() if kind == source]
+        if not methods:
+            print("%-12s %-18s %-18s —" % (source, cell(k), cell(p)))
+        for method, baseline in methods:
+            print("%-12s %-18s %-18s %s | %s | %s" %
+                  (source, cell(k), cell(p), method, cell(baseline["K"]), cell(baseline["P"])))
+    return totals
 
 
 def node(config, ident):
@@ -420,7 +693,9 @@ def stats(config):
 
 
 def check(config):
-    report = {"duplicates": 0, "invalid_utf8": 0, "invalid_dates": 0, "unknown_kinds": 0,
+    unavailable = unavailable_sources(config)
+    report = {"duplicates": 0, "invalid_utf8": 0, "invalid_dates": 0, "invalid_issue_db": 0,
+              "missing_sources": len(unavailable), "unknown_kinds": 0,
               "integrity": "missing", "fts_integrity": "missing", "orphan_links": 0}
     seen = set()
     checked_text = set()
@@ -436,6 +711,14 @@ def check(config):
             if key in checked_text:
                 continue
             checked_text.add(key)
+            if kind == "issue":
+                try:
+                    invalid = []
+                    issue_chunks(path, invalid)
+                    report["invalid_dates"] += len(invalid)
+                except (OSError, ValueError):
+                    report["invalid_issue_db"] += 1
+                continue
             try:
                 text = read_utf8(path) if kind != "map" else ""
             except (OSError, ValueError):
@@ -476,6 +759,14 @@ def main(argv=None):
     command.add_argument("--kind", action="append")
     command.add_argument("--since")
     command.add_argument("-n", type=int, default=8)
+    command = sub.add_parser("brief")
+    command.add_argument("query")
+    command.add_argument("--config", default="brain.config.json")
+    command.add_argument("-n", type=int, default=8)
+    command = sub.add_parser("eval")
+    command.add_argument("path", nargs="?", default="eval.txt")
+    command.add_argument("--config", default="brain.config.json")
+    command.add_argument("-n", type=int, default=5)
     command = sub.add_parser("node")
     command.add_argument("id")
     command.add_argument("--config", default="brain.config.json")
@@ -489,6 +780,13 @@ def main(argv=None):
         print(json.dumps(check(config), ensure_ascii=False, sort_keys=True))
     elif args.cmd == "node":
         node(config, args.id)
+    elif args.cmd == "brief":
+        brief(config, args.query, args.n)
+    elif args.cmd == "eval":
+        eval_path = Path(args.path)
+        if not eval_path.is_absolute():
+            eval_path = config["_dir"] / eval_path
+        evaluate(config, eval_path, args.n)
     else:
         find(config, args.query, args.kind, args.since, args.n)
 
