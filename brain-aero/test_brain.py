@@ -132,11 +132,13 @@ class BrainTests(unittest.TestCase):
     def test_local_embedding_build_search_and_cleanup(self):
         semantic = self.root/'manuals'/'semantic.md'
         lexical = self.root/'manuals'/'lexical.md'
+        lexical_two = self.root/'manuals'/'lexical_two.md'
         semantic.write_text('# Semantic candidate\nunrelated passage\n', encoding='utf-8')
         lexical.write_text('# rarequery reference\nrarequery lexical passage\n', encoding='utf-8')
+        lexical_two.write_text('# rarequery second reference\nrarequery another passage\n', encoding='utf-8')
         self.c['embeddings'] = {
             'enabled': True, 'model': 'fixture-model', 'cache_dir': 'model-cache',
-            'semantic_weight': 2.0, 'lexical_weight': 1.0,
+            'semantic_weight': 100.0, 'lexical_weight': 1.0,
         }
 
         class FakeEmbedder:
@@ -152,9 +154,11 @@ class BrainTests(unittest.TestCase):
         try:
             stats = brain.build(self.c)
             self.assertGreater(stats['embedded'], 0)
-            lexical_rows = brain.search_rows(self.c, 'rarequery', limit=5)
+            lexical_rows = brain.search_rows(self.c, 'rarequery', limit=20)
+            reranked_rows = brain.search_rows(self.c, 'rarequery', limit=1)
             semantic_rows = brain.search_rows(self.c, 'unmatchedquery', limit=5)
-            self.assertEqual(lexical_rows[0][4], 'rarequery reference')
+            self.assertIn('rarequery reference', {row[4] for row in lexical_rows})
+            self.assertEqual(reranked_rows[0][4], 'Semantic candidate')
             self.assertEqual(semantic_rows[0][4], 'Semantic candidate')
             report = brain.check(self.c)
             self.assertEqual(report['embedding_missing'], 0)

@@ -677,13 +677,9 @@ def search_rows(config, query, kinds=None, since=None, limit=8, fresh=False, ope
         lexical = _fts_search_rows(connection, config, query, kinds, since, fetch_limit, fresh, open_todo)
         if settings is None:
             return [row for _, row in lexical[:limit]]
-        full_lexical = _fts_search_rows(connection, config, query, kinds, since, limit, fresh, open_todo,
-                                        require_all=True)
-        lexical_prefix = lexical[:limit] if full_lexical else lexical[:1]
-        full_ids = {ident for ident, _ in lexical_prefix}
-        if len(lexical_prefix) >= limit:
-            return [row for _, row in lexical_prefix[:limit]]
-
+        # Do not return lexical hits before semantic scoring: otherwise
+        # embeddings are bypassed for every query that already has `limit` FTS
+        # hits. Lexical and semantic candidates are merged below.
         embedder, settings = _get_embedder(config)
         has_embeddings = connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='embeddings'"
@@ -706,7 +702,7 @@ def search_rows(config, query, kinds=None, since=None, limit=8, fresh=False, ope
             sql += " AND c.heading LIKE '%[ ]%'"
         vectors = connection.execute(sql, args).fetchall()
         if not vectors:
-            raise ValueError("no vectors for configured model; run brain.py build with embeddings enabled")
+            return [row for _, row in lexical[:limit]]
         semantic = []
         for item in vectors:
             row = (item[1], item[2], item[3], item[4], item[5], item[6], 0.0, item[7])
@@ -730,14 +726,7 @@ def search_rows(config, query, kinds=None, since=None, limit=8, fresh=False, ope
         candidates.sort(key=lambda item: item[2], reverse=True)
         if fresh:
             candidates.sort(key=lambda item: item[1][7] or "", reverse=True)
-        result = [row for _, row in full_lexical[:limit]]
-        for ident, row, score in candidates:
-            if ident in full_ids:
-                continue
-            result.append(row[:6] + (-score, row[7]))
-            if len(result) >= limit:
-                break
-        return result
+        return [row[:6] + (-score, row[7]) for _, row, score in candidates[:limit]]
     finally:
         connection.close()
 
